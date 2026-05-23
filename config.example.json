@@ -1,0 +1,6 @@
+{
+  "listen": ":8080",
+  "api_keys": [
+    "change-me"
+  ]
+}
