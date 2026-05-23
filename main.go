@@ -11,77 +11,94 @@ import (
 	"time"
 )
 
+const (
+	configFilePath       = "config.json"
+	statisticsFilePath   = "statistics.json"
+	resultsDirectoryPath = "results"
+	temporaryRootPath    = "/tmp/simple-latex-container"
+)
+
+// main is intentionally thin so startup orchestration can stay testable inside
+// runApplication instead of being trapped in process-global side effects.
 func main() {
 	logger := log.New(os.Stdout, "", log.LstdFlags)
 
-	if err := run(logger); err != nil {
-		logger.Printf("fatal: %v", err)
+	if runError := runApplication(logger); runError != nil {
+		logger.Printf("fatal: %v", runError)
 		os.Exit(1)
 	}
 }
 
-func run(logger *log.Logger) error {
-	cfg, err := LoadConfig("config.json")
-	if err != nil {
-		return err
+// runApplication loads configuration, verifies external dependencies, starts
+// background persistence, serves HTTP requests, and performs graceful shutdown.
+func runApplication(logger *log.Logger) error {
+	config, configError := loadConfig(configFilePath)
+	if configError != nil {
+		return configError
 	}
 
-	if err := verifyToolchain(); err != nil {
-		return err
+	if executableError := verifyRequiredExecutables(); executableError != nil {
+		return executableError
 	}
 
-	stats, err := LoadStatistics("statistics.json", cfg.APIKeys)
-	if err != nil {
-		return err
+	statisticsStore, statisticsError := loadStatistics(statisticsFilePath, config.ApiKeys)
+	if statisticsError != nil {
+		return statisticsError
 	}
 
-	if err := os.MkdirAll("results", 0o755); err != nil {
-		return err
+	if makeDirectoryError := os.MkdirAll(resultsDirectoryPath, 0o755); makeDirectoryError != nil {
+		return makeDirectoryError
 	}
-	if err := os.MkdirAll("/tmp/simple-latex-container", 0o755); err != nil {
-		return err
-	}
-
-	rootCtx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
-
-	go stats.RunAutoSave(rootCtx, 5*time.Minute, logger)
-
-	runner := ExecCommandRunner{}
-	compiler := NewCompiler("results", "/tmp/simple-latex-container", runner, PDFInfoInspector{Runner: runner})
-	app := NewApp(cfg, stats, compiler, "results")
-
-	server := &http.Server{
-		Addr:    cfg.Listen,
-		Handler: app.Routes(),
+	if makeDirectoryError := os.MkdirAll(temporaryRootPath, 0o755); makeDirectoryError != nil {
+		return makeDirectoryError
 	}
 
-	errCh := make(chan error, 1)
+	rootContext, stopSignals := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stopSignals()
+
+	go statisticsStore.runAutoSave(rootContext, 5*time.Minute, logger)
+
+	commandRunner := execCommandRunner{}
+	compileProcessor := newCompilerService(
+		resultsDirectoryPath,
+		temporaryRootPath,
+		commandRunner,
+		pdfInfoInspector{commandRunner: commandRunner},
+	)
+	application := newApplication(config, statisticsStore, compileProcessor, resultsDirectoryPath)
+
+	httpServer := &http.Server{
+		Addr:    config.Listen,
+		Handler: application.routes(),
+	}
+
+	serverErrorChannel := make(chan error, 1)
 	go func() {
-		err := server.ListenAndServe()
-		if err != nil && !errors.Is(err, http.ErrServerClosed) {
-			errCh <- err
+		listenError := httpServer.ListenAndServe()
+		if listenError != nil && !errors.Is(listenError, http.ErrServerClosed) {
+			serverErrorChannel <- listenError
 			return
 		}
-		errCh <- nil
+		serverErrorChannel <- nil
 	}()
 
 	select {
-	case err := <-errCh:
-		if err != nil {
-			return err
+	case serverError := <-serverErrorChannel:
+		if serverError != nil {
+			return serverError
 		}
-	case <-rootCtx.Done():
+	case <-rootContext.Done():
 	}
 
-	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	if err := server.Shutdown(shutdownCtx); err != nil && !errors.Is(err, http.ErrServerClosed) {
-		return err
+	shutdownContext, cancelShutdown := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancelShutdown()
+
+	if shutdownError := httpServer.Shutdown(shutdownContext); shutdownError != nil && !errors.Is(shutdownError, http.ErrServerClosed) {
+		return shutdownError
 	}
 
-	if err := stats.Save(); err != nil {
-		return err
+	if saveError := statisticsStore.save(); saveError != nil {
+		return saveError
 	}
 
 	return nil

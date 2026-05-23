@@ -1,6 +1,6 @@
 {
   "listen": ":8080",
-  "api_keys": [
+  "apiKeys": [
     "change-me"
   ]
 }

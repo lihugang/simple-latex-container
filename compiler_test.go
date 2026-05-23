@@ -11,129 +11,134 @@ import (
 	"testing"
 )
 
-type fakeRunner struct {
-	mu    sync.Mutex
+type fakeCommandRunner struct {
+	mutex sync.Mutex
 	calls []string
-	run   func(ctx context.Context, dir string, name string, args ...string) ([]byte, error)
+	run   func(requestContext context.Context, workingDirectory string, executableName string, executableArguments ...string) ([]byte, error)
 }
 
-func (f *fakeRunner) CombinedOutput(ctx context.Context, dir string, name string, args ...string) ([]byte, error) {
-	f.mu.Lock()
-	f.calls = append(f.calls, name)
-	f.mu.Unlock()
-	return f.run(ctx, dir, name, args...)
+func (runner *fakeCommandRunner) runCombinedOutput(requestContext context.Context, workingDirectory string, executableName string, executableArguments ...string) ([]byte, error) {
+	runner.mutex.Lock()
+	runner.calls = append(runner.calls, executableName)
+	runner.mutex.Unlock()
+	return runner.run(requestContext, workingDirectory, executableName, executableArguments...)
 }
 
-type fakeInspector struct {
+type fakePdfInspector struct {
 	pageCount int
-	err       error
+	readError error
 }
 
-func (f fakeInspector) PageCount(ctx context.Context, pdfPath string) (int, error) {
-	_ = ctx
-	_ = pdfPath
-	if f.err != nil {
-		return 0, f.err
+func (inspector fakePdfInspector) readPageCount(requestContext context.Context, pdfFilePath string) (int, error) {
+	_ = requestContext
+	_ = pdfFilePath
+	if inspector.readError != nil {
+		return 0, inspector.readError
 	}
-	return f.pageCount, nil
+	return inspector.pageCount, nil
 }
 
-func TestCompilerProcessCompilesAndCaches(t *testing.T) {
-	resultsDir := filepath.Join(t.TempDir(), "results")
-	tempRoot := filepath.Join(t.TempDir(), "tmp")
-	if err := os.MkdirAll(resultsDir, 0o755); err != nil {
-		t.Fatal(err)
+func TestCompilerProcessCompilesAndCaches(testingContext *testing.T) {
+	resultsDirectory := filepath.Join(testingContext.TempDir(), "results")
+	temporaryRoot := filepath.Join(testingContext.TempDir(), "temporary")
+	if makeDirectoryError := os.MkdirAll(resultsDirectory, 0o755); makeDirectoryError != nil {
+		testingContext.Fatal(makeDirectoryError)
 	}
-	if err := os.MkdirAll(tempRoot, 0o755); err != nil {
-		t.Fatal(err)
+	if makeDirectoryError := os.MkdirAll(temporaryRoot, 0o755); makeDirectoryError != nil {
+		testingContext.Fatal(makeDirectoryError)
 	}
 
-	runner := &fakeRunner{}
-	runner.run = func(ctx context.Context, dir string, name string, args ...string) ([]byte, error) {
-		_ = ctx
-		switch name {
+	commandRunner := &fakeCommandRunner{}
+	commandRunner.run = func(requestContext context.Context, workingDirectory string, executableName string, executableArguments ...string) ([]byte, error) {
+		_ = requestContext
+		_ = executableArguments
+
+		switch executableName {
 		case "xelatex":
-			return []byte("ok"), os.WriteFile(filepath.Join(dir, "main.pdf"), []byte("pdf"), 0o644)
+			return []byte("ok"), os.WriteFile(filepath.Join(workingDirectory, "main.pdf"), []byte("pdf"), 0o644)
 		case "pdftoppm":
-			for page := 1; page <= 2; page++ {
-				if err := os.WriteFile(filepath.Join(dir, fmt.Sprintf("page-%d.png", page)), []byte("png"), 0o644); err != nil {
-					return nil, err
+			for pageNumber := 1; pageNumber <= 2; pageNumber++ {
+				if writeError := os.WriteFile(filepath.Join(workingDirectory, fmt.Sprintf("page-%d.png", pageNumber)), []byte("png"), 0o644); writeError != nil {
+					return nil, writeError
 				}
 			}
 			return []byte("ok"), nil
 		default:
-			return nil, fmt.Errorf("unexpected command: %s", name)
+			return nil, fmt.Errorf("unexpected command: %s", executableName)
 		}
 	}
 
-	compiler := NewCompiler(resultsDir, tempRoot, runner, fakeInspector{pageCount: 2})
+	compileService := newCompilerService(resultsDirectory, temporaryRoot, commandRunner, fakePdfInspector{pageCount: 2})
 
-	payload := "\\documentclass{article}\\begin{document}Hello\\end{document}"
-	result, failure, err := compiler.Process(context.Background(), payload)
-	if err != nil {
-		t.Fatalf("Process returned error: %v", err)
+	latexPayload := "\\documentclass{article}\\begin{document}Hello\\end{document}"
+	result, compileFailure, processError := compileService.process(context.Background(), latexPayload)
+	if processError != nil {
+		testingContext.Fatalf("process returned error: %v", processError)
 	}
-	if failure != nil {
-		t.Fatalf("unexpected compile failure: %+v", failure)
-	}
-
-	expectedID := sha256Hex(payload)
-	if result.ID != expectedID {
-		t.Fatalf("unexpected id: got %q want %q", result.ID, expectedID)
-	}
-	if result.PageNum != 2 {
-		t.Fatalf("unexpected page count: %d", result.PageNum)
+	if compileFailure != nil {
+		testingContext.Fatalf("unexpected compile failure: %+v", compileFailure)
 	}
 
-	for _, rel := range []string{"main.tex", "main.pdf", "1.png", "2.png"} {
-		if _, err := os.Stat(filepath.Join(resultsDir, expectedID, rel)); err != nil {
-			t.Fatalf("expected result file %s: %v", rel, err)
+	expectedDocumentId := calculateSha256Hex(latexPayload)
+	if result.Id != expectedDocumentId {
+		testingContext.Fatalf("unexpected id: got %q want %q", result.Id, expectedDocumentId)
+	}
+	if result.PageNumber != 2 {
+		testingContext.Fatalf("unexpected page count: %d", result.PageNumber)
+	}
+
+	for _, relativePath := range []string{"main.tex", "main.pdf", "1.png", "2.png"} {
+		if _, statError := os.Stat(filepath.Join(resultsDirectory, expectedDocumentId, relativePath)); statError != nil {
+			testingContext.Fatalf("expected result file %s: %v", relativePath, statError)
 		}
 	}
 
-	if _, err := os.Stat(filepath.Join(tempRoot, expectedID)); !os.IsNotExist(err) {
-		t.Fatalf("expected temp dir cleanup, got err=%v", err)
+	if _, statError := os.Stat(filepath.Join(temporaryRoot, expectedDocumentId)); !os.IsNotExist(statError) {
+		testingContext.Fatalf("expected temp dir cleanup, got err=%v", statError)
 	}
 
-	before := len(runner.calls)
-	result, failure, err = compiler.Process(context.Background(), payload)
-	if err != nil || failure != nil {
-		t.Fatalf("cached Process returned err=%v failure=%+v", err, failure)
+	callCountBeforeCacheHit := len(commandRunner.calls)
+	result, compileFailure, processError = compileService.process(context.Background(), latexPayload)
+	if processError != nil || compileFailure != nil {
+		testingContext.Fatalf("cached process returned err=%v failure=%+v", processError, compileFailure)
 	}
-	if len(runner.calls) != before {
-		t.Fatalf("expected cached request to avoid external commands, calls before=%d after=%d", before, len(runner.calls))
+	if len(commandRunner.calls) != callCountBeforeCacheHit {
+		testingContext.Fatalf("expected cached request to avoid external commands, calls before=%d after=%d", callCountBeforeCacheHit, len(commandRunner.calls))
 	}
-	if result.PageNum != 2 {
-		t.Fatalf("unexpected cached page count: %d", result.PageNum)
+	if result.PageNumber != 2 {
+		testingContext.Fatalf("unexpected cached page count: %d", result.PageNumber)
 	}
 }
 
-func TestCompilerProcessReturnsCompileFailure(t *testing.T) {
-	resultsDir := filepath.Join(t.TempDir(), "results")
-	tempRoot := filepath.Join(t.TempDir(), "tmp")
-	runner := &fakeRunner{}
-	runner.run = func(ctx context.Context, dir string, name string, args ...string) ([]byte, error) {
-		_ = ctx
-		_ = dir
-		_ = args
-		if name == "xelatex" {
+func TestCompilerProcessReturnsCompileFailure(testingContext *testing.T) {
+	resultsDirectory := filepath.Join(testingContext.TempDir(), "results")
+	temporaryRoot := filepath.Join(testingContext.TempDir(), "temporary")
+
+	commandRunner := &fakeCommandRunner{}
+	commandRunner.run = func(requestContext context.Context, workingDirectory string, executableName string, executableArguments ...string) ([]byte, error) {
+		_ = requestContext
+		_ = workingDirectory
+		_ = executableArguments
+
+		if executableName == "xelatex" {
 			return []byte("raw xelatex error"), fmt.Errorf("exit status 1")
 		}
-		t.Fatalf("unexpected command: %s", name)
+
+		testingContext.Fatalf("unexpected command: %s", executableName)
 		return nil, nil
 	}
 
-	compiler := NewCompiler(resultsDir, tempRoot, runner, fakeInspector{pageCount: 1})
-	_, failure, err := compiler.Process(context.Background(), "bad")
-	if err != nil {
-		t.Fatalf("unexpected internal error: %v", err)
+	compileService := newCompilerService(resultsDirectory, temporaryRoot, commandRunner, fakePdfInspector{pageCount: 1})
+	_, compileFailure, processError := compileService.process(context.Background(), "bad")
+	if processError != nil {
+		testingContext.Fatalf("unexpected internal error: %v", processError)
 	}
-	if failure == nil || failure.Message != "raw xelatex error" {
-		t.Fatalf("unexpected compile failure: %+v", failure)
+	if compileFailure == nil || compileFailure.Message != "raw xelatex error" {
+		testingContext.Fatalf("unexpected compile failure: %+v", compileFailure)
 	}
 }
 
-func sha256Hex(input string) string {
-	sum := sha256.Sum256([]byte(input))
-	return hex.EncodeToString(sum[:])
+func calculateSha256Hex(inputText string) string {
+	hashSum := sha256.Sum256([]byte(inputText))
+	return hex.EncodeToString(hashSum[:])
 }

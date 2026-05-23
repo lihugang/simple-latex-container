@@ -13,156 +13,182 @@ import (
 	"strings"
 )
 
-var idPattern = regexp.MustCompile(`^[a-f0-9]{64}$`)
+var documentIdPattern = regexp.MustCompile(`^[a-f0-9]{64}$`)
 
-type App struct {
-	apiKeys    map[string]struct{}
-	stats      *StatisticsStore
-	compiler   CompileProcessor
-	resultsDir string
+// application wires configuration, statistics, and the compile pipeline into
+// HTTP handlers. The type stays intentionally small so the transport layer does
+// not absorb compiler or persistence logic.
+type application struct {
+	allowedApiKeys   map[string]struct{}
+	statisticsStore  *statisticsStore
+	compileProcessor compileProcessor
+	resultsDirectory string
 }
 
-type codeRequest struct {
+// codeRequestBody is the request payload for POST /code.
+type codeRequestBody struct {
 	Payload string `json:"payload"`
 }
 
+// responseEnvelope is the shared JSON response shape used by the service.
+// Keeping one envelope type avoids subtle drift between success and error paths.
 type responseEnvelope struct {
-	OK    bool   `json:"ok"`
+	Ok    bool   `json:"ok"`
 	Data  any    `json:"data"`
 	Error string `json:"error"`
 }
 
-func NewApp(cfg Config, stats *StatisticsStore, compiler CompileProcessor, resultsDir string) *App {
-	keys := make(map[string]struct{}, len(cfg.APIKeys))
-	for _, key := range cfg.APIKeys {
-		keys[key] = struct{}{}
+// newApplication builds the HTTP layer from already-initialized dependencies.
+func newApplication(config serviceConfig, statisticsStore *statisticsStore, compileProcessor compileProcessor, resultsDirectory string) *application {
+	allowedApiKeys := make(map[string]struct{}, len(config.ApiKeys))
+	for _, apiKey := range config.ApiKeys {
+		allowedApiKeys[apiKey] = struct{}{}
 	}
 
-	return &App{
-		apiKeys:    keys,
-		stats:      stats,
-		compiler:   compiler,
-		resultsDir: resultsDir,
+	return &application{
+		allowedApiKeys:   allowedApiKeys,
+		statisticsStore:  statisticsStore,
+		compileProcessor: compileProcessor,
+		resultsDirectory: resultsDirectory,
 	}
 }
 
-func (a *App) Routes() http.Handler {
-	mux := http.NewServeMux()
-	mux.HandleFunc("POST /code", a.handleCode)
-	mux.HandleFunc("GET /{id}/pdf", a.handlePDF)
-	mux.HandleFunc("GET /{id}/png/{pagenum}", a.handlePNG)
-	return mux
+// routes registers all public HTTP endpoints exposed by the service.
+func (application *application) routes() http.Handler {
+	requestRouter := http.NewServeMux()
+	requestRouter.HandleFunc("POST /code", application.handleCode)
+	requestRouter.HandleFunc("GET /{id}/pdf", application.handlePdf)
+	requestRouter.HandleFunc("GET /{id}/png/{pageNumber}", application.handlePng)
+	return requestRouter
 }
 
-func (a *App) handleCode(w http.ResponseWriter, r *http.Request) {
-	apiKey, ok := a.authorize(r)
-	if !ok {
-		writeJSON(w, http.StatusUnauthorized, responseEnvelope{OK: false, Data: nil, Error: "unauthorized"})
+// handleCode authenticates the request, validates the body, records usage, and
+// delegates the actual document pipeline to the compile processor.
+func (application *application) handleCode(responseWriter http.ResponseWriter, request *http.Request) {
+	apiKey, authorized := application.authorizeRequest(request)
+	if !authorized {
+		writeJson(responseWriter, http.StatusUnauthorized, responseEnvelope{Ok: false, Data: nil, Error: "unauthorized"})
 		return
 	}
 
-	var req codeRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeJSON(w, http.StatusBadRequest, responseEnvelope{OK: false, Data: nil, Error: "invalid json body"})
+	var requestBody codeRequestBody
+	if decodeError := json.NewDecoder(request.Body).Decode(&requestBody); decodeError != nil {
+		writeJson(responseWriter, http.StatusBadRequest, responseEnvelope{Ok: false, Data: nil, Error: "invalid json body"})
 		return
 	}
-	if strings.TrimSpace(req.Payload) == "" {
-		writeJSON(w, http.StatusBadRequest, responseEnvelope{OK: false, Data: nil, Error: "payload must not be empty"})
-		return
-	}
-
-	a.stats.Increment(apiKey)
-
-	result, failure, err := a.compiler.Process(r.Context(), req.Payload)
-	if failure != nil {
-		writeJSON(w, http.StatusOK, responseEnvelope{OK: false, Data: nil, Error: failure.Message})
-		return
-	}
-	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, responseEnvelope{OK: false, Data: nil, Error: err.Error()})
+	if strings.TrimSpace(requestBody.Payload) == "" {
+		writeJson(responseWriter, http.StatusBadRequest, responseEnvelope{Ok: false, Data: nil, Error: "payload must not be empty"})
 		return
 	}
 
-	writeJSON(w, http.StatusOK, responseEnvelope{OK: true, Data: result, Error: ""})
+	application.statisticsStore.incrementUsage(apiKey)
+
+	compileResult, compileFailure, processError := application.compileProcessor.process(request.Context(), requestBody.Payload)
+	if compileFailure != nil {
+		// Compilation failures are part of the API contract, so they stay at the
+		// JSON level instead of being promoted to HTTP 500 responses.
+		writeJson(responseWriter, http.StatusOK, responseEnvelope{Ok: false, Data: nil, Error: compileFailure.Message})
+		return
+	}
+	if processError != nil {
+		writeJson(responseWriter, http.StatusInternalServerError, responseEnvelope{Ok: false, Data: nil, Error: processError.Error()})
+		return
+	}
+
+	writeJson(responseWriter, http.StatusOK, responseEnvelope{Ok: true, Data: compileResult, Error: ""})
 }
 
-func (a *App) handlePDF(w http.ResponseWriter, r *http.Request) {
-	id := r.PathValue("id")
-	if !validID(id) {
-		http.NotFound(w, r)
+// handlePdf serves the cached PDF artifact for a document identifier.
+func (application *application) handlePdf(responseWriter http.ResponseWriter, request *http.Request) {
+	documentId := request.PathValue("id")
+	if !isValidDocumentId(documentId) {
+		http.NotFound(responseWriter, request)
 		return
 	}
 
-	path := filepath.Join(a.resultsDir, id, "main.pdf")
-	a.serveStaticFile(w, r, path, "application/pdf")
+	pdfFilePath := filepath.Join(application.resultsDirectory, documentId, "main.pdf")
+	application.serveStaticFile(responseWriter, request, pdfFilePath, "application/pdf")
 }
 
-func (a *App) handlePNG(w http.ResponseWriter, r *http.Request) {
-	id := r.PathValue("id")
-	if !validID(id) {
-		http.NotFound(w, r)
+// handlePng serves a specific PNG page for a document identifier.
+func (application *application) handlePng(responseWriter http.ResponseWriter, request *http.Request) {
+	documentId := request.PathValue("id")
+	if !isValidDocumentId(documentId) {
+		http.NotFound(responseWriter, request)
 		return
 	}
 
-	pageNum, err := strconv.Atoi(r.PathValue("pagenum"))
-	if err != nil || pageNum <= 0 {
-		http.NotFound(w, r)
+	pageNumber, parseError := strconv.Atoi(request.PathValue("pageNumber"))
+	if parseError != nil || pageNumber <= 0 {
+		http.NotFound(responseWriter, request)
 		return
 	}
 
-	path := filepath.Join(a.resultsDir, id, fmt.Sprintf("%d.png", pageNum))
-	a.serveStaticFile(w, r, path, "image/png")
+	pngFilePath := filepath.Join(application.resultsDirectory, documentId, fmt.Sprintf("%d.png", pageNumber))
+	application.serveStaticFile(responseWriter, request, pngFilePath, "image/png")
 }
 
-func (a *App) serveStaticFile(w http.ResponseWriter, r *http.Request, path, contentType string) {
-	if _, err := os.Stat(path); err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			http.NotFound(w, r)
+// serveStaticFile returns a cached artifact with a one-year immutable cache
+// policy. Missing files become 404 responses, while unexpected filesystem
+// errors are treated as internal server errors.
+func (application *application) serveStaticFile(responseWriter http.ResponseWriter, request *http.Request, filePath string, contentType string) {
+	if _, statError := os.Stat(filePath); statError != nil {
+		if errors.Is(statError, os.ErrNotExist) {
+			http.NotFound(responseWriter, request)
 			return
 		}
-		writeJSON(w, http.StatusInternalServerError, responseEnvelope{OK: false, Data: nil, Error: "internal server error"})
+		writeJson(responseWriter, http.StatusInternalServerError, responseEnvelope{Ok: false, Data: nil, Error: "internal server error"})
 		return
 	}
 
-	w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
-	w.Header().Set("Content-Type", contentType)
-	http.ServeFile(w, r, path)
+	responseWriter.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
+	responseWriter.Header().Set("Content-Type", contentType)
+	http.ServeFile(responseWriter, request, filePath)
 }
 
-func (a *App) authorize(r *http.Request) (string, bool) {
-	header := strings.TrimSpace(r.Header.Get("Authorization"))
-	if header == "" {
-		return "", false
-	}
-	const prefix = "Bearer "
-	if !strings.HasPrefix(header, prefix) {
+// authorizeRequest accepts only Authorization headers in Bearer form and
+// checks the token against the configured in-memory API key set.
+func (application *application) authorizeRequest(request *http.Request) (string, bool) {
+	authorizationHeader := strings.TrimSpace(request.Header.Get("Authorization"))
+	if authorizationHeader == "" {
 		return "", false
 	}
 
-	apiKey := strings.TrimSpace(strings.TrimPrefix(header, prefix))
+	const bearerPrefix = "Bearer "
+	if !strings.HasPrefix(authorizationHeader, bearerPrefix) {
+		return "", false
+	}
+
+	apiKey := strings.TrimSpace(strings.TrimPrefix(authorizationHeader, bearerPrefix))
 	if apiKey == "" {
 		return "", false
 	}
-	_, ok := a.apiKeys[apiKey]
-	return apiKey, ok
+
+	_, authorized := application.allowedApiKeys[apiKey]
+	return apiKey, authorized
 }
 
-func validID(id string) bool {
-	return idPattern.MatchString(id)
+// isValidDocumentId enforces the sha256-hex identifier format used by the
+// compiler so the file-serving endpoints cannot escape the results directory.
+func isValidDocumentId(documentId string) bool {
+	return documentIdPattern.MatchString(documentId)
 }
 
-func writeJSON(w http.ResponseWriter, statusCode int, payload responseEnvelope) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(statusCode)
-	_ = json.NewEncoder(w).Encode(payload)
+// writeJson serializes the response envelope and sets the HTTP status code.
+func writeJson(responseWriter http.ResponseWriter, statusCode int, payload responseEnvelope) {
+	responseWriter.Header().Set("Content-Type", "application/json")
+	responseWriter.WriteHeader(statusCode)
+	_ = json.NewEncoder(responseWriter).Encode(payload)
 }
 
-var lookPath = exec.LookPath
+var executableLookup = exec.LookPath
 
-func verifyToolchain() error {
-	for _, name := range []string{"xelatex", "pdfinfo", "pdftoppm"} {
-		if _, err := lookPath(name); err != nil {
-			return fmt.Errorf("required executable %q not found in PATH", name)
+// verifyRequiredExecutables fails fast at startup if one of the required
+// external tools is missing from PATH.
+func verifyRequiredExecutables() error {
+	for _, executableName := range []string{"xelatex", "pdfinfo", "pdftoppm"} {
+		if _, lookupError := executableLookup(executableName); lookupError != nil {
+			return fmt.Errorf("required executable %q not found in PATH", executableName)
 		}
 	}
 	return nil
