@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"sync"
 	"testing"
 )
@@ -14,12 +15,18 @@ import (
 type fakeCommandRunner struct {
 	mutex sync.Mutex
 	calls []string
+	args  map[string][][]string
 	run   func(requestContext context.Context, workingDirectory string, executableName string, executableArguments ...string) ([]byte, error)
 }
 
 func (runner *fakeCommandRunner) runCombinedOutput(requestContext context.Context, workingDirectory string, executableName string, executableArguments ...string) ([]byte, error) {
 	runner.mutex.Lock()
 	runner.calls = append(runner.calls, executableName)
+	if runner.args == nil {
+		runner.args = make(map[string][][]string)
+	}
+	argumentCopy := append([]string(nil), executableArguments...)
+	runner.args[executableName] = append(runner.args[executableName], argumentCopy)
 	runner.mutex.Unlock()
 	return runner.run(requestContext, workingDirectory, executableName, executableArguments...)
 }
@@ -68,7 +75,7 @@ func TestCompilerProcessCompilesAndCaches(testingContext *testing.T) {
 		}
 	}
 
-	compileService := newCompilerService(resultsDirectory, temporaryRoot, commandRunner, fakePdfInspector{pageCount: 2})
+	compileService := newCompilerService(resultsDirectory, temporaryRoot, 450, commandRunner, fakePdfInspector{pageCount: 2})
 
 	latexPayload := "\\documentclass{article}\\begin{document}Hello\\end{document}"
 	result, compileFailure, processError := compileService.process(context.Background(), latexPayload)
@@ -85,6 +92,11 @@ func TestCompilerProcessCompilesAndCaches(testingContext *testing.T) {
 	}
 	if result.PageNumber != 2 {
 		testingContext.Fatalf("unexpected page count: %d", result.PageNumber)
+	}
+
+	expectedPdftoppmArguments := []string{"-r", "450", "-png", "main.pdf", "page"}
+	if !reflect.DeepEqual(commandRunner.args["pdftoppm"][0], expectedPdftoppmArguments) {
+		testingContext.Fatalf("unexpected pdftoppm args: got %v want %v", commandRunner.args["pdftoppm"][0], expectedPdftoppmArguments)
 	}
 
 	for _, relativePath := range []string{"main.tex", "main.pdf", "1.png", "2.png"} {
@@ -128,7 +140,7 @@ func TestCompilerProcessReturnsCompileFailure(testingContext *testing.T) {
 		return nil, nil
 	}
 
-	compileService := newCompilerService(resultsDirectory, temporaryRoot, commandRunner, fakePdfInspector{pageCount: 1})
+	compileService := newCompilerService(resultsDirectory, temporaryRoot, 450, commandRunner, fakePdfInspector{pageCount: 1})
 	_, compileFailure, processError := compileService.process(context.Background(), "bad")
 	if processError != nil {
 		testingContext.Fatalf("unexpected internal error: %v", processError)

@@ -1,5 +1,6 @@
 {
   "listen": ":8080",
+  "pdfToPngDpi": 450,
   "apiKeys": [
     "change-me"
   ]

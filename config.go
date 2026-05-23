@@ -12,8 +12,9 @@ import (
 // The file is intentionally small because this service only needs a listen
 // address and a fixed in-memory list of allowed API keys.
 type serviceConfig struct {
-	Listen  string   `json:"listen"`
-	ApiKeys []string `json:"apiKeys"`
+	Listen      string   `json:"listen"`
+	ApiKeys     []string `json:"apiKeys"`
+	PdfToPngDpi int      `json:"pdfToPngDpi"`
 }
 
 // loadConfig reads the JSON configuration file, applies defaults, and rejects
@@ -31,6 +32,12 @@ func loadConfig(filePath string) (serviceConfig, error) {
 
 	if config.Listen == "" {
 		config.Listen = ":8080"
+	}
+	if config.PdfToPngDpi == 0 {
+		config.PdfToPngDpi = 450
+	}
+	if config.PdfToPngDpi <= 0 {
+		return serviceConfig{}, errors.New("config.pdfToPngDpi must be greater than 0")
 	}
 
 	if len(config.ApiKeys) == 0 {

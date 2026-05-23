@@ -100,6 +100,7 @@ func (inspector pdfInfoInspector) readPageCount(requestContext context.Context, 
 type compilerService struct {
 	resultsDirectory string
 	temporaryRoot    string
+	pdfToPngDpi      int
 	commandRunner    commandRunner
 	pdfInspector     pdfInspector
 	keyedLocker      *documentKeyLocker
@@ -107,10 +108,11 @@ type compilerService struct {
 
 // newCompilerService constructs a compiler with all dependencies provided
 // explicitly so the pipeline can be tested without shelling out.
-func newCompilerService(resultsDirectory string, temporaryRoot string, commandRunner commandRunner, pdfInspector pdfInspector) *compilerService {
+func newCompilerService(resultsDirectory string, temporaryRoot string, pdfToPngDpi int, commandRunner commandRunner, pdfInspector pdfInspector) *compilerService {
 	return &compilerService{
 		resultsDirectory: resultsDirectory,
 		temporaryRoot:    temporaryRoot,
+		pdfToPngDpi:      pdfToPngDpi,
 		commandRunner:    commandRunner,
 		pdfInspector:     pdfInspector,
 		keyedLocker:      newDocumentKeyLocker(),
@@ -209,6 +211,8 @@ func (service *compilerService) compileDocument(requestContext context.Context, 
 		requestContext,
 		temporaryDirectory,
 		"pdftoppm",
+		"-r",
+		strconv.Itoa(service.pdfToPngDpi),
 		"-png",
 		"main.pdf",
 		"page",

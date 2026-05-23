@@ -62,6 +62,7 @@ func runApplication(logger *log.Logger) error {
 	compileProcessor := newCompilerService(
 		resultsDirectoryPath,
 		temporaryRootPath,
+		config.PdfToPngDpi,
 		commandRunner,
 		pdfInfoInspector{commandRunner: commandRunner},
 	)
