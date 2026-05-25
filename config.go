@@ -12,9 +12,12 @@ import (
 // The file is intentionally small because this service only needs a listen
 // address and a fixed in-memory list of allowed API keys.
 type serviceConfig struct {
-	Listen      string   `json:"listen"`
-	ApiKeys     []string `json:"apiKeys"`
-	PdfToPngDpi int      `json:"pdfToPngDpi"`
+	Listen                string   `json:"listen"`
+	ApiKeys               []string `json:"apiKeys"`
+	PdfToPngDpi           int      `json:"pdfToPngDpi"`
+	MaxConcurrentCompiles int      `json:"maxConcurrentCompiles"`
+	CompileTimeoutSeconds int      `json:"compileTimeoutSeconds"`
+	HttpTimeoutSeconds    int      `json:"httpTimeoutSeconds"`
 }
 
 // loadConfig reads the JSON configuration file, applies defaults, and rejects
@@ -38,6 +41,15 @@ func loadConfig(filePath string) (serviceConfig, error) {
 	}
 	if config.PdfToPngDpi <= 0 {
 		return serviceConfig{}, errors.New("config.pdfToPngDpi must be greater than 0")
+	}
+	if config.MaxConcurrentCompiles < 0 {
+		return serviceConfig{}, errors.New("config.maxConcurrentCompiles must be greater than or equal to 0")
+	}
+	if config.CompileTimeoutSeconds < 0 {
+		return serviceConfig{}, errors.New("config.compileTimeoutSeconds must be greater than or equal to 0")
+	}
+	if config.HttpTimeoutSeconds < 0 {
+		return serviceConfig{}, errors.New("config.httpTimeoutSeconds must be greater than or equal to 0")
 	}
 
 	if len(config.ApiKeys) == 0 {

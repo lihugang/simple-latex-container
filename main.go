@@ -63,15 +63,13 @@ func runApplication(logger *log.Logger) error {
 		resultsDirectoryPath,
 		temporaryRootPath,
 		config.PdfToPngDpi,
+		config.MaxConcurrentCompiles,
 		commandRunner,
 		pdfInfoInspector{commandRunner: commandRunner},
 	)
 	application := newApplication(config, statisticsStore, compileProcessor, resultsDirectoryPath)
 
-	httpServer := &http.Server{
-		Addr:    config.Listen,
-		Handler: application.routes(),
-	}
+	httpServer := newHTTPServer(config, application.routes())
 
 	serverErrorChannel := make(chan error, 1)
 	go func() {
@@ -103,4 +101,23 @@ func runApplication(logger *log.Logger) error {
 	}
 
 	return nil
+}
+
+// newHTTPServer constructs the HTTP server and applies a unified timeout policy
+// when configured. A zero timeout leaves the standard-library defaults in place.
+func newHTTPServer(config serviceConfig, handler http.Handler) *http.Server {
+	httpServer := &http.Server{
+		Addr:    config.Listen,
+		Handler: handler,
+	}
+
+	if config.HttpTimeoutSeconds > 0 {
+		timeout := time.Duration(config.HttpTimeoutSeconds) * time.Second
+		httpServer.ReadTimeout = timeout
+		httpServer.WriteTimeout = timeout
+		httpServer.ReadHeaderTimeout = timeout
+		httpServer.IdleTimeout = timeout
+	}
+
+	return httpServer
 }

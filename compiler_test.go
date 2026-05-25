@@ -9,7 +9,9 @@ import (
 	"path/filepath"
 	"reflect"
 	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 )
 
 type fakeCommandRunner struct {
@@ -75,7 +77,7 @@ func TestCompilerProcessCompilesAndCaches(testingContext *testing.T) {
 		}
 	}
 
-	compileService := newCompilerService(resultsDirectory, temporaryRoot, 450, commandRunner, fakePdfInspector{pageCount: 2})
+	compileService := newCompilerService(resultsDirectory, temporaryRoot, 450, 0, commandRunner, fakePdfInspector{pageCount: 2})
 
 	latexPayload := "\\documentclass{article}\\begin{document}Hello\\end{document}"
 	result, compileFailure, processError := compileService.process(context.Background(), latexPayload)
@@ -140,13 +142,104 @@ func TestCompilerProcessReturnsCompileFailure(testingContext *testing.T) {
 		return nil, nil
 	}
 
-	compileService := newCompilerService(resultsDirectory, temporaryRoot, 450, commandRunner, fakePdfInspector{pageCount: 1})
+	compileService := newCompilerService(resultsDirectory, temporaryRoot, 450, 0, commandRunner, fakePdfInspector{pageCount: 1})
 	_, compileFailure, processError := compileService.process(context.Background(), "bad")
 	if processError != nil {
 		testingContext.Fatalf("unexpected internal error: %v", processError)
 	}
 	if compileFailure == nil || compileFailure.Message != "raw xelatex error" {
 		testingContext.Fatalf("unexpected compile failure: %+v", compileFailure)
+	}
+}
+
+func TestCompilerProcessLimitsGlobalConcurrentCompiles(testingContext *testing.T) {
+	resultsDirectory := filepath.Join(testingContext.TempDir(), "results")
+	temporaryRoot := filepath.Join(testingContext.TempDir(), "temporary")
+	if makeDirectoryError := os.MkdirAll(resultsDirectory, 0o755); makeDirectoryError != nil {
+		testingContext.Fatal(makeDirectoryError)
+	}
+	if makeDirectoryError := os.MkdirAll(temporaryRoot, 0o755); makeDirectoryError != nil {
+		testingContext.Fatal(makeDirectoryError)
+	}
+
+	commandRunner := &fakeCommandRunner{}
+	releaseCompile := make(chan struct{})
+	compileStarted := make(chan string, 2)
+	var activeCompiles int32
+	var maxActiveCompiles int32
+
+	commandRunner.run = func(requestContext context.Context, workingDirectory string, executableName string, executableArguments ...string) ([]byte, error) {
+		_ = executableArguments
+
+		switch executableName {
+		case "xelatex":
+			currentActiveCompiles := atomic.AddInt32(&activeCompiles, 1)
+			for {
+				observedMax := atomic.LoadInt32(&maxActiveCompiles)
+				if currentActiveCompiles <= observedMax || atomic.CompareAndSwapInt32(&maxActiveCompiles, observedMax, currentActiveCompiles) {
+					break
+				}
+			}
+
+			compileStarted <- filepath.Base(workingDirectory)
+			select {
+			case <-releaseCompile:
+			case <-requestContext.Done():
+				atomic.AddInt32(&activeCompiles, -1)
+				return nil, requestContext.Err()
+			}
+			atomic.AddInt32(&activeCompiles, -1)
+			return []byte("ok"), os.WriteFile(filepath.Join(workingDirectory, "main.pdf"), []byte("pdf"), 0o644)
+		case "pdftoppm":
+			if writeError := os.WriteFile(filepath.Join(workingDirectory, "page-1.png"), []byte("png"), 0o644); writeError != nil {
+				return nil, writeError
+			}
+			return []byte("ok"), nil
+		default:
+			return nil, fmt.Errorf("unexpected command: %s", executableName)
+		}
+	}
+
+	compileService := newCompilerService(resultsDirectory, temporaryRoot, 450, 1, commandRunner, fakePdfInspector{pageCount: 1})
+
+	resultsChannel := make(chan error, 2)
+	for _, latexPayload := range []string{"first", "second"} {
+		go func(payload string) {
+			_, _, processError := compileService.process(context.Background(), payload)
+			resultsChannel <- processError
+		}(latexPayload)
+	}
+
+	select {
+	case <-compileStarted:
+	case <-time.After(2 * time.Second):
+		testingContext.Fatal("expected first compile to start")
+	}
+
+	select {
+	case <-compileStarted:
+		testingContext.Fatal("second compile started before the first one released the global slot")
+	case <-time.After(150 * time.Millisecond):
+	}
+
+	releaseCompile <- struct{}{}
+
+	select {
+	case <-compileStarted:
+	case <-time.After(2 * time.Second):
+		testingContext.Fatal("expected second compile to start after the first slot was released")
+	}
+
+	releaseCompile <- struct{}{}
+
+	for range 2 {
+		if processError := <-resultsChannel; processError != nil {
+			testingContext.Fatalf("process returned error: %v", processError)
+		}
+	}
+
+	if actualValue := atomic.LoadInt32(&maxActiveCompiles); actualValue != 1 {
+		testingContext.Fatalf("unexpected max active compiles: got %d want 1", actualValue)
 	}
 }
 

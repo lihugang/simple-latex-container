@@ -1,6 +1,9 @@
 {
   "listen": ":8080",
   "pdfToPngDpi": 450,
+  "maxConcurrentCompiles": 1,
+  "compileTimeoutSeconds": 30,
+  "httpTimeoutSeconds": 120,
   "apiKeys": [
     "change-me"
   ]

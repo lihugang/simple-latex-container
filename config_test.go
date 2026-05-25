@@ -25,6 +25,15 @@ func TestLoadConfigDefaultsAndValidation(testingContext *testing.T) {
 	if config.PdfToPngDpi != 450 {
 		testingContext.Fatalf("unexpected default pdfToPngDpi: %d", config.PdfToPngDpi)
 	}
+	if config.MaxConcurrentCompiles != 0 {
+		testingContext.Fatalf("unexpected default maxConcurrentCompiles: %d", config.MaxConcurrentCompiles)
+	}
+	if config.CompileTimeoutSeconds != 0 {
+		testingContext.Fatalf("unexpected default compileTimeoutSeconds: %d", config.CompileTimeoutSeconds)
+	}
+	if config.HttpTimeoutSeconds != 0 {
+		testingContext.Fatalf("unexpected default httpTimeoutSeconds: %d", config.HttpTimeoutSeconds)
+	}
 	if actualValue, expectedValue := config.ApiKeys[0], "key1"; actualValue != expectedValue {
 		testingContext.Fatalf("unexpected trimmed key: got %q want %q", actualValue, expectedValue)
 	}
@@ -34,7 +43,7 @@ func TestLoadConfigAcceptsExplicitPdfToPngDpi(testingContext *testing.T) {
 	temporaryDirectory := testingContext.TempDir()
 	configFilePath := filepath.Join(temporaryDirectory, "config.json")
 
-	if writeError := os.WriteFile(configFilePath, []byte(`{"apiKeys":["key1"],"pdfToPngDpi":600}`), 0o644); writeError != nil {
+	if writeError := os.WriteFile(configFilePath, []byte(`{"apiKeys":["key1"],"pdfToPngDpi":600,"maxConcurrentCompiles":1,"compileTimeoutSeconds":30,"httpTimeoutSeconds":120}`), 0o644); writeError != nil {
 		testingContext.Fatal(writeError)
 	}
 
@@ -44,6 +53,15 @@ func TestLoadConfigAcceptsExplicitPdfToPngDpi(testingContext *testing.T) {
 	}
 	if config.PdfToPngDpi != 600 {
 		testingContext.Fatalf("unexpected explicit pdfToPngDpi: %d", config.PdfToPngDpi)
+	}
+	if config.MaxConcurrentCompiles != 1 {
+		testingContext.Fatalf("unexpected explicit maxConcurrentCompiles: %d", config.MaxConcurrentCompiles)
+	}
+	if config.CompileTimeoutSeconds != 30 {
+		testingContext.Fatalf("unexpected explicit compileTimeoutSeconds: %d", config.CompileTimeoutSeconds)
+	}
+	if config.HttpTimeoutSeconds != 120 {
+		testingContext.Fatalf("unexpected explicit httpTimeoutSeconds: %d", config.HttpTimeoutSeconds)
 	}
 }
 
@@ -70,5 +88,44 @@ func TestLoadConfigRejectsNonPositivePdfToPngDpi(testingContext *testing.T) {
 
 	if _, loadError := loadConfig(configFilePath); loadError == nil {
 		testingContext.Fatal("expected pdfToPngDpi validation error")
+	}
+}
+
+func TestLoadConfigRejectsNegativeMaxConcurrentCompiles(testingContext *testing.T) {
+	temporaryDirectory := testingContext.TempDir()
+	configFilePath := filepath.Join(temporaryDirectory, "config.json")
+
+	if writeError := os.WriteFile(configFilePath, []byte(`{"apiKeys":["key1"],"maxConcurrentCompiles":-1}`), 0o644); writeError != nil {
+		testingContext.Fatal(writeError)
+	}
+
+	if _, loadError := loadConfig(configFilePath); loadError == nil {
+		testingContext.Fatal("expected maxConcurrentCompiles validation error")
+	}
+}
+
+func TestLoadConfigRejectsNegativeCompileTimeoutSeconds(testingContext *testing.T) {
+	temporaryDirectory := testingContext.TempDir()
+	configFilePath := filepath.Join(temporaryDirectory, "config.json")
+
+	if writeError := os.WriteFile(configFilePath, []byte(`{"apiKeys":["key1"],"compileTimeoutSeconds":-1}`), 0o644); writeError != nil {
+		testingContext.Fatal(writeError)
+	}
+
+	if _, loadError := loadConfig(configFilePath); loadError == nil {
+		testingContext.Fatal("expected compileTimeoutSeconds validation error")
+	}
+}
+
+func TestLoadConfigRejectsNegativeHttpTimeoutSeconds(testingContext *testing.T) {
+	temporaryDirectory := testingContext.TempDir()
+	configFilePath := filepath.Join(temporaryDirectory, "config.json")
+
+	if writeError := os.WriteFile(configFilePath, []byte(`{"apiKeys":["key1"],"httpTimeoutSeconds":-1}`), 0o644); writeError != nil {
+		testingContext.Fatal(writeError)
+	}
+
+	if _, loadError := loadConfig(configFilePath); loadError == nil {
+		testingContext.Fatal("expected httpTimeoutSeconds validation error")
 	}
 }

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -11,6 +12,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"time"
 )
 
 var documentIdPattern = regexp.MustCompile(`^[a-f0-9]{64}$`)
@@ -22,6 +24,7 @@ type application struct {
 	allowedApiKeys   map[string]struct{}
 	statisticsStore  *statisticsStore
 	compileProcessor compileProcessor
+	compileTimeout   time.Duration
 	resultsDirectory string
 }
 
@@ -49,6 +52,7 @@ func newApplication(config serviceConfig, statisticsStore *statisticsStore, comp
 		allowedApiKeys:   allowedApiKeys,
 		statisticsStore:  statisticsStore,
 		compileProcessor: compileProcessor,
+		compileTimeout:   time.Duration(config.CompileTimeoutSeconds) * time.Second,
 		resultsDirectory: resultsDirectory,
 	}
 }
@@ -83,7 +87,14 @@ func (application *application) handleCode(responseWriter http.ResponseWriter, r
 
 	application.statisticsStore.incrementUsage(apiKey)
 
-	compileResult, compileFailure, processError := application.compileProcessor.process(request.Context(), requestBody.Payload)
+	compileContext := request.Context()
+	cancelCompile := func() {}
+	if application.compileTimeout > 0 {
+		compileContext, cancelCompile = context.WithTimeout(request.Context(), application.compileTimeout)
+	}
+	defer cancelCompile()
+
+	compileResult, compileFailure, processError := application.compileProcessor.process(compileContext, requestBody.Payload)
 	if compileFailure != nil {
 		// Compilation failures are part of the API contract, so they stay at the
 		// JSON level instead of being promoted to HTTP 500 responses.
@@ -91,6 +102,10 @@ func (application *application) handleCode(responseWriter http.ResponseWriter, r
 		return
 	}
 	if processError != nil {
+		if errors.Is(processError, context.DeadlineExceeded) {
+			writeJson(responseWriter, http.StatusGatewayTimeout, responseEnvelope{Ok: false, Data: nil, Error: "compile timed out"})
+			return
+		}
 		writeJson(responseWriter, http.StatusInternalServerError, responseEnvelope{Ok: false, Data: nil, Error: processError.Error()})
 		return
 	}

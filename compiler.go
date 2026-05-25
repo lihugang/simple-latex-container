@@ -101,6 +101,7 @@ type compilerService struct {
 	resultsDirectory string
 	temporaryRoot    string
 	pdfToPngDpi      int
+	compileSlots     chan struct{}
 	commandRunner    commandRunner
 	pdfInspector     pdfInspector
 	keyedLocker      *documentKeyLocker
@@ -108,11 +109,18 @@ type compilerService struct {
 
 // newCompilerService constructs a compiler with all dependencies provided
 // explicitly so the pipeline can be tested without shelling out.
-func newCompilerService(resultsDirectory string, temporaryRoot string, pdfToPngDpi int, commandRunner commandRunner, pdfInspector pdfInspector) *compilerService {
+
+func newCompilerService(resultsDirectory string, temporaryRoot string, pdfToPngDpi int, maxConcurrentCompiles int, commandRunner commandRunner, pdfInspector pdfInspector) *compilerService {
+	var compileSlots chan struct{}
+	if maxConcurrentCompiles > 0 {
+		compileSlots = make(chan struct{}, maxConcurrentCompiles)
+	}
+
 	return &compilerService{
 		resultsDirectory: resultsDirectory,
 		temporaryRoot:    temporaryRoot,
 		pdfToPngDpi:      pdfToPngDpi,
+		compileSlots:     compileSlots,
 		commandRunner:    commandRunner,
 		pdfInspector:     pdfInspector,
 		keyedLocker:      newDocumentKeyLocker(),
@@ -126,7 +134,10 @@ func (service *compilerService) process(requestContext context.Context, latexPay
 	hashSum := sha256.Sum256([]byte(latexPayload))
 	documentId := hex.EncodeToString(hashSum[:])
 
-	unlockDocument := service.keyedLocker.lockForDocument(documentId)
+	unlockDocument, lockError := service.keyedLocker.lockForDocument(requestContext, documentId)
+	if lockError != nil {
+		return compileResult{}, nil, lockError
+	}
 	defer unlockDocument()
 
 	cachedResult, cacheHit, cacheError := service.loadCachedResult(requestContext, documentId)
@@ -137,7 +148,30 @@ func (service *compilerService) process(requestContext context.Context, latexPay
 		return cachedResult, nil, nil
 	}
 
+	releaseCompileSlot, acquireError := service.acquireCompileSlot(requestContext)
+	if acquireError != nil {
+		return compileResult{}, nil, acquireError
+	}
+	defer releaseCompileSlot()
+
 	return service.compileDocument(requestContext, documentId, latexPayload)
+}
+
+// acquireCompileSlot limits the number of concurrent cache-miss compilations.
+// A nil release function means global compile limiting is disabled.
+func (service *compilerService) acquireCompileSlot(requestContext context.Context) (func(), error) {
+	if service.compileSlots == nil {
+		return func() {}, nil
+	}
+
+	select {
+	case service.compileSlots <- struct{}{}:
+		return func() {
+			<-service.compileSlots
+		}, nil
+	case <-requestContext.Done():
+		return nil, requestContext.Err()
+	}
 }
 
 // loadCachedResult validates that the cached artifact set is complete before it
@@ -297,9 +331,9 @@ type documentKeyLocker struct {
 }
 
 // documentLockEntry stores the actual lock and a reference counter so unused
-// per-document mutexes can be discarded when no goroutine still references them.
+// per-document lock entries can be discarded when no goroutine still references them.
 type documentLockEntry struct {
-	mutex          sync.Mutex
+	lockChannel    chan struct{}
 	referenceCount int
 }
 
@@ -310,21 +344,33 @@ func newDocumentKeyLocker() *documentKeyLocker {
 
 // lockForDocument returns an unlock function for the given document identifier.
 // The outer registry mutex protects creation and cleanup of lock entries, while
-// the inner mutex serializes work for one specific document.
-func (locker *documentKeyLocker) lockForDocument(documentId string) func() {
+// the inner mutex serializes work for one specific document. Waiting for the
+// per-document lock is cancellable through the provided context.
+func (locker *documentKeyLocker) lockForDocument(requestContext context.Context, documentId string) (func(), error) {
 	locker.mutex.Lock()
 	lockEntry := locker.lockEntries[documentId]
 	if lockEntry == nil {
-		lockEntry = &documentLockEntry{}
+		lockEntry = &documentLockEntry{lockChannel: make(chan struct{}, 1)}
+		lockEntry.lockChannel <- struct{}{}
 		locker.lockEntries[documentId] = lockEntry
 	}
 	lockEntry.referenceCount++
 	locker.mutex.Unlock()
 
-	lockEntry.mutex.Lock()
+	select {
+	case <-lockEntry.lockChannel:
+	case <-requestContext.Done():
+		locker.mutex.Lock()
+		lockEntry.referenceCount--
+		if lockEntry.referenceCount == 0 {
+			delete(locker.lockEntries, documentId)
+		}
+		locker.mutex.Unlock()
+		return nil, requestContext.Err()
+	}
 
 	return func() {
-		lockEntry.mutex.Unlock()
+		lockEntry.lockChannel <- struct{}{}
 
 		locker.mutex.Lock()
 		defer locker.mutex.Unlock()
@@ -333,5 +379,5 @@ func (locker *documentKeyLocker) lockForDocument(documentId string) func() {
 		if lockEntry.referenceCount == 0 {
 			delete(locker.lockEntries, documentId)
 		}
-	}
+	}, nil
 }

@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 type fakeCompileProcessor struct {
@@ -117,4 +118,48 @@ func TestStaticFileHandlers(testingContext *testing.T) {
 	if pngResponseRecorder.Code != http.StatusOK {
 		testingContext.Fatalf("unexpected png status: %d", pngResponseRecorder.Code)
 	}
+}
+
+func TestHandleCodeCompileTimeout(testingContext *testing.T) {
+	temporaryDirectory := testingContext.TempDir()
+	statisticsStore, loadError := loadStatistics(filepath.Join(temporaryDirectory, "statistics.json"), []string{"secret"})
+	if loadError != nil {
+		testingContext.Fatal(loadError)
+	}
+
+	blockingProcessor := compileProcessorFunc(func(requestContext context.Context, latexPayload string) (compileResult, *compileFailure, error) {
+		_ = latexPayload
+		<-requestContext.Done()
+		return compileResult{}, nil, requestContext.Err()
+	})
+
+	application := newApplication(serviceConfig{ApiKeys: []string{"secret"}, CompileTimeoutSeconds: 1}, statisticsStore, blockingProcessor, filepath.Join(temporaryDirectory, "results"))
+
+	request := httptest.NewRequest(http.MethodPost, "/code", bytes.NewBufferString(`{"payload":"\\documentclass{article}"}`))
+	request.Header.Set("Authorization", "Bearer secret")
+	responseRecorder := httptest.NewRecorder()
+
+	startTime := time.Now()
+	application.routes().ServeHTTP(responseRecorder, request)
+	if elapsedTime := time.Since(startTime); elapsedTime < 900*time.Millisecond {
+		testingContext.Fatalf("expected compile timeout to wait for context deadline, elapsed=%v", elapsedTime)
+	}
+
+	if responseRecorder.Code != http.StatusGatewayTimeout {
+		testingContext.Fatalf("unexpected status: %d", responseRecorder.Code)
+	}
+
+	var responseBody responseEnvelope
+	if unmarshalError := json.Unmarshal(responseRecorder.Body.Bytes(), &responseBody); unmarshalError != nil {
+		testingContext.Fatalf("unmarshal response: %v", unmarshalError)
+	}
+	if responseBody.Error != "compile timed out" {
+		testingContext.Fatalf("unexpected timeout error: %q", responseBody.Error)
+	}
+}
+
+type compileProcessorFunc func(requestContext context.Context, latexPayload string) (compileResult, *compileFailure, error)
+
+func (processor compileProcessorFunc) process(requestContext context.Context, latexPayload string) (compileResult, *compileFailure, error) {
+	return processor(requestContext, latexPayload)
 }
