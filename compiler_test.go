@@ -95,6 +95,9 @@ func TestCompilerProcessCompilesAndCaches(testingContext *testing.T) {
 	if result.PageNumber != 2 {
 		testingContext.Fatalf("unexpected page count: %d", result.PageNumber)
 	}
+	if result.CacheHit {
+		testingContext.Fatal("expected first compile result to report cacheHit=false")
+	}
 
 	expectedPdftoppmArguments := []string{"-r", "450", "-png", "main.pdf", "page"}
 	if !reflect.DeepEqual(commandRunner.args["pdftoppm"][0], expectedPdftoppmArguments) {
@@ -121,6 +124,9 @@ func TestCompilerProcessCompilesAndCaches(testingContext *testing.T) {
 	}
 	if result.PageNumber != 2 {
 		testingContext.Fatalf("unexpected cached page count: %d", result.PageNumber)
+	}
+	if !result.CacheHit {
+		testingContext.Fatal("expected cached compile result to report cacheHit=true")
 	}
 }
 

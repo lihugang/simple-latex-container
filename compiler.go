@@ -22,6 +22,7 @@ import (
 type compileResult struct {
 	Id         string `json:"id"`
 	PageNumber int    `json:"pageNumber"`
+	CacheHit   bool   `json:"cacheHit"`
 }
 
 // compileFailure represents a user-visible LaTeX compilation failure.
@@ -145,6 +146,7 @@ func (service *compilerService) process(requestContext context.Context, latexPay
 		return compileResult{}, nil, cacheError
 	}
 	if cacheHit {
+		cachedResult.CacheHit = true
 		return cachedResult, nil, nil
 	}
 
@@ -294,7 +296,7 @@ func (service *compilerService) compileDocument(requestContext context.Context, 
 	}
 	shouldDeleteStageDirectory = false
 
-	return compileResult{Id: documentId, PageNumber: pageCount}, nil, nil
+	return compileResult{Id: documentId, PageNumber: pageCount, CacheHit: false}, nil, nil
 }
 
 // copyFile copies one artifact file from source to destination without trying

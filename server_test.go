@@ -32,7 +32,7 @@ func TestHandleCodeSuccess(testingContext *testing.T) {
 		testingContext.Fatal(loadError)
 	}
 
-	compileProcessor := &fakeCompileProcessor{result: compileResult{Id: "abc", PageNumber: 2}}
+	compileProcessor := &fakeCompileProcessor{result: compileResult{Id: "abc", PageNumber: 2, CacheHit: true}}
 	application := newApplication(serviceConfig{ApiKeys: []string{"secret"}}, statisticsStore, compileProcessor, filepath.Join(temporaryDirectory, "results"))
 
 	request := httptest.NewRequest(http.MethodPost, "/code", bytes.NewBufferString(`{"payload":"\\documentclass{article}"}`))
@@ -51,6 +51,13 @@ func TestHandleCodeSuccess(testingContext *testing.T) {
 	}
 	if !responseBody.Ok {
 		testingContext.Fatalf("expected ok response, got %+v", responseBody)
+	}
+	responseData, ok := responseBody.Data.(map[string]any)
+	if !ok {
+		testingContext.Fatalf("unexpected response data type: %T", responseBody.Data)
+	}
+	if actualValue, ok := responseData["cacheHit"].(bool); !ok || !actualValue {
+		testingContext.Fatalf("unexpected cacheHit value: %#v", responseData["cacheHit"])
 	}
 	if compileProcessor.payload == "" {
 		testingContext.Fatal("expected compiler to be called")
